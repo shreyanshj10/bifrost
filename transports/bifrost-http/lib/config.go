@@ -679,6 +679,8 @@ type Config struct {
 	// GovernanceFileSync is what the last LoadConfig wrote from config.json's teams and customers.
 	GovernanceFileSync GovernanceFileSync
 
+	virtualKeyAgentGrantsChanged map[string]bool // file virtual keys written this load; see applyVirtualKeyAgentGrants
+
 	// Stores
 	ConfigStore configstore.ConfigStore
 	VectorStore vectorstore.VectorStore
@@ -1157,7 +1159,9 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 	loadGovernanceConfig(ctx, config, &configData)
 	// 8a. Agent Gateway registrations (after governance so file-declared virtual
 	// keys exist before agent grants referencing them are written)
-	loadAgentsConfig(ctx, config, &configData)
+	fileAgents, writtenAgents := loadAgentsConfig(ctx, config, &configData)
+	// 8b. agent_grants declared on virtual keys (after agents, which those grant rows reference)
+	applyVirtualKeyAgentGrants(ctx, config, &configData, fileAgents, writtenAgents)
 	// 9. Auth config
 	if err := loadAuthConfig(ctx, config, &configData); err != nil {
 		return nil, err
@@ -3017,8 +3021,10 @@ func syncWebhookEndpointsFromFile(ctx context.Context, config *Config, fileEndpo
 // written here: the agent manager does not exist yet at LoadConfig time and is
 // built later (InitializeAgentGateway) from the reconciled rows. Writes go
 // through the configstore CRUD so GORM hooks encrypt secrets and grant rows
-// are kept transactional with their registration.
-func loadAgentsConfig(ctx context.Context, config *Config, configData *ConfigData) {
+// are kept transactional with their registration. It returns the declarations
+// that passed validation and the names it created or updated, which
+// applyVirtualKeyAgentGrants needs.
+func loadAgentsConfig(ctx context.Context, config *Config, configData *ConfigData) ([]*schemas.AgentRegistration, map[string]bool) {
 	fileAgents := make([]*schemas.AgentRegistration, 0, len(configData.Agents))
 	// Every declared name, valid or not: an entry that fails validation must
 	// still protect its existing database row from the source-of-truth prune —
@@ -3054,32 +3060,32 @@ func loadAgentsConfig(ctx context.Context, config *Config, configData *ConfigDat
 		if len(fileAgents) > 0 {
 			logger.Warn("config store is disabled - agent registrations from config file will not be available")
 		}
-		return
+		return fileAgents, nil
 	}
 
 	existing, err := config.ConfigStore.ListAgentRegistrations(ctx)
 	if err != nil {
 		logger.Warn("failed to load agent registrations: %v", err)
-		return
+		return fileAgents, nil
 	}
 
 	if configData.isConfigJSONSourceOfTruth() && configData.sectionPresent("agents") {
-		syncAgentRegistrationsFromFile(ctx, config, fileAgents, declaredNames, existing)
-	} else {
-		mergeAgentRegistrations(ctx, config, fileAgents, existing)
+		return fileAgents, syncAgentRegistrationsFromFile(ctx, config, fileAgents, declaredNames, existing)
 	}
+	return fileAgents, mergeAgentRegistrations(ctx, config, fileAgents, existing)
 }
 
 // mergeAgentRegistrations reconciles file declarations additively: new names
 // are created, changed ones (by config hash) are updated — grants included,
 // since virtual_key_ids participates in the hash — and stored registrations
 // absent from the file are left alone. Best-effort with per-item warnings,
-// matching the other config-section loaders.
-func mergeAgentRegistrations(ctx context.Context, config *Config, fileAgents []*schemas.AgentRegistration, existing []schemas.AgentRegistration) {
+// matching the other config-section loaders. Returns the names it wrote.
+func mergeAgentRegistrations(ctx context.Context, config *Config, fileAgents []*schemas.AgentRegistration, existing []schemas.AgentRegistration) map[string]bool {
 	existingByName := make(map[string]*schemas.AgentRegistration, len(existing))
 	for i := range existing {
 		existingByName[existing[i].Name] = &existing[i]
 	}
+	written := make(map[string]bool)
 	for _, agent := range fileAgents {
 		fileHash, err := configstore.GenerateAgentRegistrationHash(agent)
 		if err != nil {
@@ -3093,13 +3099,18 @@ func mergeAgentRegistrations(ctx context.Context, config *Config, fileAgents []*
 			}
 			if err := config.ConfigStore.UpdateAgentRegistration(ctx, agent); err != nil {
 				logger.Warn("failed to update agent registration %q: %v", agent.Name, err)
+				continue
 			}
+			written[agent.Name] = true
 			continue
 		}
 		if err := config.ConfigStore.CreateAgentRegistration(ctx, agent); err != nil {
 			logger.Warn("failed to create agent registration %q: %v", agent.Name, err)
+			continue
 		}
+		written[agent.Name] = true
 	}
+	return written
 }
 
 // syncAgentRegistrationsFromFile makes the database mirror the config file:
@@ -3111,13 +3122,14 @@ func mergeAgentRegistrations(ctx context.Context, config *Config, fileAgents []*
 // converges. The prune fails safe: a row is only deleted when its name appears
 // in NEITHER the applied set nor the declared set, so a declaration that
 // failed validation or hashing keeps its existing registration instead of
-// removing it.
-func syncAgentRegistrationsFromFile(ctx context.Context, config *Config, fileAgents []*schemas.AgentRegistration, declaredNames map[string]bool, existing []schemas.AgentRegistration) {
+// removing it. Returns the names it created or updated.
+func syncAgentRegistrationsFromFile(ctx context.Context, config *Config, fileAgents []*schemas.AgentRegistration, declaredNames map[string]bool, existing []schemas.AgentRegistration) map[string]bool {
 	existingByName := make(map[string]*schemas.AgentRegistration, len(existing))
 	for i := range existing {
 		existingByName[existing[i].Name] = &existing[i]
 	}
 
+	written := make(map[string]bool)
 	keepNames := make(map[string]bool, len(fileAgents))
 	for _, agent := range fileAgents {
 		match := existingByName[agent.Name]
@@ -3141,7 +3153,9 @@ func syncAgentRegistrationsFromFile(ctx context.Context, config *Config, fileAge
 			}
 			if err := config.ConfigStore.UpdateAgentRegistration(ctx, agent); err != nil {
 				logger.Warn("failed to update agent registration %q: %v", agent.Name, err)
+				continue
 			}
+			written[agent.Name] = true
 			continue
 		}
 		if err := config.ConfigStore.CreateAgentRegistration(ctx, agent); err != nil {
@@ -3149,6 +3163,7 @@ func syncAgentRegistrationsFromFile(ctx context.Context, config *Config, fileAge
 			continue
 		}
 		keepNames[agent.Name] = true
+		written[agent.Name] = true
 	}
 
 	for i := range existing {
@@ -3157,6 +3172,48 @@ func syncAgentRegistrationsFromFile(ctx context.Context, config *Config, fileAge
 		}
 		if err := config.ConfigStore.DeleteAgentRegistration(ctx, existing[i].Name); err != nil {
 			logger.Warn("failed to delete agent registration %q: %v", existing[i].Name, err)
+		}
+	}
+	return written
+}
+
+// applyVirtualKeyAgentGrants writes the agent_grants that config.json declares on virtual keys.
+// It runs after loadAgentsConfig because a grant row references both the key and the agent:
+// written with the key during the governance sync, a grant to an agent declared in the same
+// file would fail its foreign key and roll back the whole governance section.
+//
+// A key's grants are replaced when this load created or changed the key, or wrote an agent the
+// key names, since writing an agent replaces every grant row for that agent with its own
+// virtual_key_ids. The replacement keeps the grants file-declared agents give the key through
+// virtual_key_ids, so a grant can be declared from either side. A key that omits agent_grants
+// is left alone. An unknown agent name skips that key's grants with a warning, matching the
+// warn-and-skip policy of the agents section.
+func applyVirtualKeyAgentGrants(ctx context.Context, config *Config, configData *ConfigData, fileAgents []*schemas.AgentRegistration, writtenAgents map[string]bool) {
+	changed := config.virtualKeyAgentGrantsChanged
+	config.virtualKeyAgentGrantsChanged = nil
+	if config.ConfigStore == nil || configData.Governance == nil {
+		return
+	}
+	for _, vk := range configData.Governance.VirtualKeys {
+		if vk.AgentGrants == nil || vk.ID == "" {
+			continue
+		}
+		apply := changed[vk.ID]
+		names := make([]string, 0, len(vk.AgentGrants))
+		for _, agentGrant := range vk.AgentGrants {
+			names = append(names, agentGrant.AgentName)
+			apply = apply || writtenAgents[agentGrant.AgentName]
+		}
+		if !apply {
+			continue
+		}
+		for _, agent := range fileAgents {
+			if slices.Contains(agent.VirtualKeyIDs, vk.ID) && !slices.Contains(names, agent.Name) {
+				names = append(names, agent.Name)
+			}
+		}
+		if err := config.ConfigStore.ReplaceVirtualKeyAgentGrants(ctx, vk.ID, names); err != nil {
+			logger.Warn("skipping agent_grants of virtual key %s from config file: %v", vk.ID, err)
 		}
 	}
 }
@@ -3917,6 +3974,14 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 		config.GovernanceConfig.ComplexityAnalyzerConfig = complexityAnalyzerConfigToUpdate
 	}
 	if config.ConfigStore != nil && hasChanges {
+		config.virtualKeyAgentGrantsChanged = make(map[string]bool)
+		for _, vks := range [][]configstoreTables.TableVirtualKey{virtualKeysToAdd, virtualKeysToUpdate} {
+			for _, vk := range vks {
+				if vk.AgentGrants != nil {
+					config.virtualKeyAgentGrantsChanged[vk.ID] = true
+				}
+			}
+		}
 		// Taken before the write, which strips the customers' inline budgets in place.
 		fileSync := GovernanceFileSync{
 			Teams:     append(append([]configstoreTables.TableTeam{}, teamsToAdd...), teamsToUpdate...),
@@ -4809,8 +4874,11 @@ func updateGovernanceConfigInStore(
 			virtualKey := &virtualKeysToAdd[i]
 			providerConfigs := virtualKey.ProviderConfigs
 			mcpConfigs := virtualKey.MCPConfigs
+			// Agent grants reference agents, which load after governance; applyVirtualKeyAgentGrants writes them.
+			agentGrants := virtualKey.AgentGrants
 			virtualKey.ProviderConfigs = nil
 			virtualKey.MCPConfigs = nil
+			virtualKey.AgentGrants = nil
 			// Here we wll filter provider / keys that are not available
 			if err := config.ConfigStore.CreateVirtualKey(ctx, virtualKey, tx); err != nil {
 				return fmt.Errorf("failed to create virtual key %s: %w", virtualKey.ID, err)
@@ -4830,10 +4898,12 @@ func updateGovernanceConfigInStore(
 
 			virtualKey.ProviderConfigs = providerConfigs
 			virtualKey.MCPConfigs = mcpConfigs
+			virtualKey.AgentGrants = agentGrants
 		}
 
 		// Update virtual keys (config.json changed)
 		for _, virtualKey := range virtualKeysToUpdate {
+			virtualKey.AgentGrants = nil // written by applyVirtualKeyAgentGrants once agents exist
 			if err := reconcileVirtualKeyAssociations(ctx, config.ConfigStore, tx, virtualKey.ID, virtualKey.Budgets, virtualKey.ProviderConfigs, virtualKey.MCPConfigs, fileBudgetIDs); err != nil {
 				return fmt.Errorf("failed to reconcile associations for virtual key %s: %w", virtualKey.ID, err)
 			}
